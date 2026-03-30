@@ -36,15 +36,16 @@ jobs:
           :: Шифруем только hwid_auth.py
           pyarmor gen -O obf_dist proxy/hwid_auth.py
           
-          :: Копируем зашифрованный файл обратно (теперь через CMD)
+          :: Копируем зашифрованный файл обратно
           copy /Y obf_dist\hwid_auth.py proxy\hwid_auth.py
           
-          :: Копируем папку runtime. /S /E /I /Y - ключи для копирования папок
+          :: Копируем папку runtime для работы защиты
           xcopy obf_dist\pyarmor_runtime_000000 proxy\pyarmor_runtime_000000 /S /E /I /Y
 
       - name: Build with PyInstaller
+        shell: cmd
         run: |
-          :: Собираем EXE. PyInstaller упакует всё вместе
+          :: Собираем EXE. Теперь точно через CMD
           pyinstaller packaging/windows.spec
 
       - name: Upload Secure EXE
