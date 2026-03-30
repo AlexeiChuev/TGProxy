@@ -32,6 +32,14 @@ except ImportError:
 
 import proxy.tg_ws_proxy as tg_ws_proxy
 
+# --- ИМПОРТ НАШЕГО МОДУЛЯ HWID ---
+try:
+    from proxy.hwid_auth import get_hwid, generate_key, is_activated, save_key
+except ImportError:
+    # Заглушка на случай, если файл еще не создан
+    def is_activated(): return True
+# ---------------------------------
+
 from utils.tray_common import (
     APP_NAME, DEFAULT_CONFIG, FIRST_RUN_MARKER, IS_FROZEN, LOG_FILE,
     acquire_lock, bootstrap, check_ipv6_warning, ctk_run_dialog,
@@ -310,6 +318,76 @@ def _build_menu():
     )
 
 
+# --- ФУНКЦИЯ ЗАПРОСА АКТИВАЦИИ ---
+def require_activation() -> bool:
+    if ctk is None:
+        # Если графическая библиотека не установлена, пропускаем
+        return is_activated()
+        
+    if is_activated():
+        return True
+
+    hwid = get_hwid()
+    result = [False] # Храним результат для доступа из внутренней функции
+    
+    ctk.set_appearance_mode("system")
+    app = ctk.CTk()
+    app.title("Активация Proxy")
+    app.geometry("450x320")
+    
+    try:
+        app.iconbitmap(ICON_PATH)
+    except Exception:
+        pass
+
+    ctk.CTkLabel(app, text="Программа привязана к оборудованию.", font=("Arial", 14, "bold")).pack(pady=(20, 5))
+    ctk.CTkLabel(app, text="Ваш HWID (скопируйте и отправьте админу):").pack(pady=0)
+    
+    # Поле с HWID (только для чтения, но можно скопировать)
+    hwid_entry = ctk.CTkEntry(app, width=300)
+    hwid_entry.insert(0, hwid)
+    hwid_entry.configure(state="readonly")
+    hwid_entry.pack(pady=5)
+    
+    ctk.CTkLabel(app, text="Введите полученный ключ доступа:").pack(pady=(10, 0))
+    
+    key_entry = ctk.CTkEntry(app, width=300, placeholder_text="Ключ активации...")
+    key_entry.pack(pady=5)
+    
+    # --- НОВАЯ ГАЛОЧКА АВТОЗАПУСКА ---
+    autostart_var = ctk.BooleanVar(value=is_autostart_enabled())
+    autostart_cb = ctk.CTkCheckBox(app, text="Запускать вместе с Windows", variable=autostart_var)
+    autostart_cb.pack(pady=10)
+    # ---------------------------------
+    
+    def verify_and_close():
+        user_input = key_entry.get().strip()
+        if user_input == generate_key(hwid):
+            save_key(user_input)
+            
+            # --- ПРИМЕНЯЕМ НАСТРОЙКИ АВТОЗАПУСКА ПРИ УСПЕШНОЙ АКТИВАЦИИ ---
+            if _supports_autostart():
+                set_autostart_enabled(autostart_var.get())
+                cfg = load_config()
+                cfg["autostart"] = autostart_var.get()
+                save_config(cfg)
+            # -------------------------------------------------------------
+                
+            result[0] = True
+            app.destroy()
+        else:
+            key_entry.configure(border_color="red")
+            
+    ctk.CTkButton(app, text="Активировать", command=verify_and_close).pack(pady=10)
+    
+    # Если пользователь просто закрыл окно на "крестик"
+    app.protocol("WM_DELETE_WINDOW", app.destroy)
+    app.mainloop()
+    
+    return result[0]
+# ---------------------------------
+
+
 # entry point
 
 def run_tray() -> None:
@@ -345,6 +423,13 @@ def main() -> None:
     if not acquire_lock("windows.py"):
         _show_info("Приложение уже запущено.", os.path.basename(sys.argv[0]))
         return
+        
+    # --- ПРОВЕРКА ЛИЦЕНЗИИ ПЕРЕД ЗАПУСКОМ ---
+    if not require_activation():
+        release_lock()
+        sys.exit(0)
+    # ----------------------------------------
+        
     try:
         run_tray()
     finally:
