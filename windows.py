@@ -34,20 +34,21 @@ import proxy.tg_ws_proxy as tg_ws_proxy
 
 # --- ИМПОРТ НАШЕГО МОДУЛЯ HWID ---
 try:
-    from proxy.hwid_auth import get_hwid, generate_key, is_activated, save_key
+    from proxy.hwid_auth import get_hwid, generate_key, is_activated, save_key, SECRET_SALT
 except ImportError as _err:
     _err_msg = str(_err)
     def is_activated(): return False
     def get_hwid(): return f"ОШИБКА_ИМПОРТА: {_err_msg}"
     def generate_key(hwid): return "ERROR"
     def save_key(key): pass
+    SECRET_SALT = "ОШИБКА_ИМПОРТА"
 # ---------------------------------
 
 from utils.tray_common import (
-    APP_NAME, DEFAULT_CONFIG, FIRST_RUN_MARKER, IS_FROZEN, LOG_FILE,
+    DEFAULT_CONFIG, FIRST_RUN_MARKER, IS_FROZEN, LOG_FILE,
     acquire_lock, bootstrap, check_ipv6_warning, ctk_run_dialog,
     ensure_ctk_thread, ensure_dirs, load_config, load_icon, log,
-    maybe_notify_update, quit_ctk, release_lock, restart_proxy,
+    quit_ctk, release_lock, restart_proxy,
     save_config, start_proxy, stop_proxy, tg_proxy_url,
 )
 from ui.ctk_tray_ui import (
@@ -65,6 +66,7 @@ _config: dict = {}
 _exiting = False
 
 ICON_PATH = str(Path(__file__).parent / "icon.ico")
+APP_NAME_CLEAN = "TGProxy"
 
 # win32 dialogs
 
@@ -78,15 +80,15 @@ _MB_YESNO_Q = 0x24
 _IDYES = 6
 
 
-def _show_error(text: str, title: str = "TG WS Proxy — Ошибка") -> None:
+def _show_error(text: str, title: str = "TGProxy — Ошибка") -> None:
     _u32.MessageBoxW(None, text, title, _MB_OK_ERR)
 
 
-def _show_info(text: str, title: str = "TG WS Proxy") -> None:
+def _show_info(text: str, title: str = "TGProxy") -> None:
     _u32.MessageBoxW(None, text, title, _MB_OK_INFO)
 
 
-def _ask_yes_no(text: str, title: str = "TG WS Proxy") -> bool:
+def _ask_yes_no(text: str, title: str = "TGProxy") -> bool:
     return _u32.MessageBoxW(None, text, title, _MB_YESNO_Q) == _IDYES
 
 
@@ -106,7 +108,7 @@ def _autostart_command() -> str:
 def is_autostart_enabled() -> bool:
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0, winreg.KEY_READ) as k:
-            val, _ = winreg.QueryValueEx(k, APP_NAME)
+            val, _ = winreg.QueryValueEx(k, APP_NAME_CLEAN)
         return str(val).strip() == _autostart_command().strip()
     except (FileNotFoundError, OSError):
         return False
@@ -114,4 +116,353 @@ def is_autostart_enabled() -> bool:
 
 def set_autostart_enabled(enabled: bool) -> None:
     try:
-        with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as k:
+            if enabled:
+                winreg.SetValueEx(k, APP_NAME_CLEAN, 0, winreg.REG_SZ, _autostart_command())
+            else:
+                try:
+                    winreg.DeleteValue(k, APP_NAME_CLEAN)
+                except FileNotFoundError:
+                    pass
+    except OSError as exc:
+        log.error("Failed to update autostart: %s", exc)
+        _show_error(
+            "Не удалось изменить автозапуск.\n\n"
+            "Попробуйте запустить приложение от имени пользователя "
+            f"с правами на реестр.\n\nОшибка: {exc}"
+        )
+
+
+# tray callbacks
+
+def _on_open_in_telegram(icon=None, item=None) -> None:
+    url = tg_proxy_url(_config)
+    log.info("Opening %s", url)
+    try:
+        if not webbrowser.open(url):
+            raise RuntimeError
+    except Exception:
+        log.info("Browser open failed, copying to clipboard")
+        if pyperclip is None:
+            _show_error(
+                "Не удалось открыть Telegram автоматически.\n\n"
+                f"Установите пакет pyperclip для копирования в буфер или откройте вручную:\n{url}"
+            )
+            return
+        try:
+            pyperclip.copy(url)
+            _show_info(
+                "Не удалось открыть Telegram автоматически.\n\n"
+                f"Ссылка скопирована в буфер обмена, отправьте её в Telegram и нажмите по ней ЛКМ:\n{url}"
+            )
+        except Exception as exc:
+            log.error("Clipboard copy failed: %s", exc)
+            _show_error(f"Не удалось скопировать ссылку:\n{exc}")
+
+
+def _on_copy_link(icon=None, item=None) -> None:
+    url = tg_proxy_url(_config)
+    log.info("Copying link: %s", url)
+    if pyperclip is None:
+        _show_error(
+            "Установите пакет pyperclip для копирования в буфер обмена."
+        )
+        return
+    try:
+        pyperclip.copy(url)
+    except Exception as exc:
+        log.error("Clipboard copy failed: %s", exc)
+        _show_error(f"Не удалось скопировать ссылку:\n{exc}")
+
+
+def _on_restart(icon=None, item=None) -> None:
+    threading.Thread(
+        target=lambda: restart_proxy(_config, _show_error), daemon=True
+    ).start()
+
+
+def _on_edit_config(icon=None, item=None) -> None:
+    threading.Thread(target=_edit_config_dialog, daemon=True).start()
+
+
+def _on_open_logs(icon=None, item=None) -> None:
+    log.info("Opening log file: %s", LOG_FILE)
+    if LOG_FILE.exists():
+        os.startfile(str(LOG_FILE))
+    else:
+        _show_info("Файл логов ещё не создан.")
+
+
+def _on_exit(icon=None, item=None) -> None:
+    global _exiting
+    if _exiting:
+        os._exit(0)
+        return
+    _exiting = True
+    log.info("User requested exit")
+    quit_ctk()
+    threading.Thread(target=lambda: (time.sleep(3), os._exit(0)), daemon=True, name="force-exit").start()
+    if icon:
+        icon.stop()
+
+
+# settings dialog
+
+def _edit_config_dialog() -> None:
+    if not ensure_ctk_thread(ctk):
+        _show_error("customtkinter не установлен.")
+        return
+
+    cfg = dict(_config)
+    cfg["autostart"] = is_autostart_enabled()
+    if _supports_autostart() and not cfg["autostart"]:
+        set_autostart_enabled(False)
+
+    def _build(done: threading.Event) -> None:
+        theme = ctk_theme_for_platform()
+        w, h = CONFIG_DIALOG_SIZE
+        if _supports_autostart():
+            h += 100
+
+        root = create_ctk_toplevel(
+            ctk, title="TGProxy — Настройки", width=w, height=h, theme=theme,
+            after_create=lambda r: r.iconbitmap(ICON_PATH),
+        )
+        fpx, fpy = CONFIG_DIALOG_FRAME_PAD
+        frame = main_content_frame(ctk, root, theme, padx=fpx, pady=fpy)
+        scroll, footer = tray_settings_scroll_and_footer(ctk, frame, theme)
+        widgets = install_tray_config_form(
+            ctk, scroll, theme, cfg, DEFAULT_CONFIG,
+            show_autostart=_supports_autostart(),
+            autostart_value=cfg.get("autostart", False),
+        )
+
+        def _finish() -> None:
+            root.destroy()
+            done.set()
+
+        def on_save() -> None:
+            from tkinter import messagebox
+            merged = validate_config_form(widgets, DEFAULT_CONFIG, include_autostart=_supports_autostart())
+            if isinstance(merged, str):
+                messagebox.showerror("TGProxy — Ошибка", merged, parent=root)
+                return
+            save_config(merged)
+            _config.update(merged)
+            log.info("Config saved: %s", merged)
+            if _supports_autostart():
+                set_autostart_enabled(bool(merged.get("autostart", False)))
+            _tray_icon.menu = _build_menu()
+
+            do_restart = messagebox.askyesno(
+                "Перезапустить?",
+                "Настройки сохранены.\n\nПерезапустить прокси сейчас?",
+                parent=root,
+            )
+            _finish()
+            if do_restart:
+                threading.Thread(target=lambda: restart_proxy(_config, _show_error), daemon=True).start()
+
+        root.protocol("WM_DELETE_WINDOW", _finish)
+        install_tray_config_buttons(ctk, footer, theme, on_save=on_save, on_cancel=_finish)
+
+    ctk_run_dialog(_build)
+
+
+# first run
+
+def _show_first_run() -> None:
+    ensure_dirs()
+    if FIRST_RUN_MARKER.exists():
+        return
+    if not ensure_ctk_thread(ctk):
+        FIRST_RUN_MARKER.touch()
+        return
+
+    host = _config.get("host", DEFAULT_CONFIG["host"])
+    port = _config.get("port", DEFAULT_CONFIG["port"])
+    secret = _config.get("secret", DEFAULT_CONFIG["secret"])
+
+    def _build(done: threading.Event) -> None:
+        theme = ctk_theme_for_platform()
+        w, h = FIRST_RUN_SIZE
+        root = create_ctk_toplevel(
+            ctk, title="TGProxy", width=w, height=h, theme=theme,
+            after_create=lambda r: r.iconbitmap(ICON_PATH),
+        )
+
+        def on_done(open_tg: bool) -> None:
+            FIRST_RUN_MARKER.touch()
+            root.destroy()
+            done.set()
+            if open_tg:
+                _on_open_in_telegram()
+
+        populate_first_run_window(ctk, root, theme, host=host, port=port, secret=secret, on_done=on_done)
+
+    ctk_run_dialog(_build)
+
+
+# tray menu
+
+def _build_menu():
+    if pystray is None:
+        return None
+    host = _config.get("host", DEFAULT_CONFIG["host"])
+    port = _config.get("port", DEFAULT_CONFIG["port"])
+    link_host = tg_ws_proxy.get_link_host(host)
+    return pystray.Menu(
+        pystray.MenuItem(f"Открыть в Telegram ({link_host}:{port})", _on_open_in_telegram, default=True),
+        pystray.MenuItem("Скопировать ссылку", _on_copy_link),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Перезапустить прокси", _on_restart),
+        pystray.MenuItem("Настройки...", _on_edit_config),
+        pystray.MenuItem("Открыть логи", _on_open_logs),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Выход", _on_exit),
+    )
+
+
+# --- ФУНКЦИЯ ЗАПРОСА АКТИВАЦИИ ---
+def require_activation() -> bool:
+    if ctk is None:
+        return is_activated()
+        
+    if is_activated():
+        return True
+
+    hwid = get_hwid()
+    result = [False]
+    
+    ctk.set_appearance_mode("system")
+    app = ctk.CTk()
+    app.title("Активация TGProxy")
+    app.geometry("500x380")
+    
+    try:
+        app.iconbitmap(ICON_PATH)
+    except Exception:
+        pass
+
+    ctk.CTkLabel(app, text="Программа привязана к оборудованию.", font=("Arial", 14, "bold")).pack(pady=(20, 5))
+    ctk.CTkLabel(app, text="Ваш HWID (отправьте админу для получения ключа):").pack(pady=0)
+    
+    # --- Блок HWID с кнопкой "Копировать" ---
+    hwid_frame = ctk.CTkFrame(app, fg_color="transparent")
+    hwid_frame.pack(pady=5)
+    
+    hwid_entry = ctk.CTkEntry(hwid_frame, width=280)
+    hwid_entry.insert(0, hwid)
+    hwid_entry.configure(state="readonly")
+    hwid_entry.pack(side="left", padx=(0, 10))
+    
+    def copy_hwid():
+        app.clipboard_clear()
+        app.clipboard_append(hwid)
+        
+    ctk.CTkButton(hwid_frame, text="Копировать", width=90, command=copy_hwid).pack(side="left")
+    # ----------------------------------------
+    
+    # --- ДЕБАГ: ВЫВОДИМ СЕКРЕТЫ НА ЭКРАН ---
+    ctk.CTkLabel(app, text=f"Вшитая соль: {SECRET_SALT}", text_color="red").pack(pady=0)
+    ctk.CTkLabel(app, text=f"Ожидаемый ключ: {generate_key(hwid)}", text_color="red").pack(pady=0)
+    # ---------------------------------------
+    
+    ctk.CTkLabel(app, text="Введите полученный ключ доступа:").pack(pady=(10, 0))
+    
+    # --- Блок Ключа с кнопкой "Вставить" ---
+    key_frame = ctk.CTkFrame(app, fg_color="transparent")
+    key_frame.pack(pady=5)
+    
+    key_entry = ctk.CTkEntry(key_frame, width=280, placeholder_text="Ключ активации...")
+    key_entry.pack(side="left", padx=(0, 10))
+    
+    def paste_key():
+        try:
+            clipboard_text = app.clipboard_get()
+            key_entry.delete(0, "end")
+            key_entry.insert(0, clipboard_text)
+        except Exception:
+            pass
+            
+    ctk.CTkButton(key_frame, text="Вставить", width=90, command=paste_key).pack(side="left")
+    # ---------------------------------------
+    
+    autostart_var = ctk.BooleanVar(value=is_autostart_enabled())
+    autostart_cb = ctk.CTkCheckBox(app, text="Запускать вместе с Windows", variable=autostart_var)
+    autostart_cb.pack(pady=10)
+    
+    def verify_and_close():
+        user_input = key_entry.get().strip()
+        if user_input == generate_key(hwid):
+            save_key(user_input)
+            
+            if _supports_autostart():
+                set_autostart_enabled(autostart_var.get())
+                cfg = load_config()
+                cfg["autostart"] = autostart_var.get()
+                save_config(cfg)
+                
+            result[0] = True
+            app.destroy()
+        else:
+            key_entry.configure(border_color="red")
+            
+    ctk.CTkButton(app, text="Активировать", command=verify_and_close).pack(pady=10)
+    
+    app.protocol("WM_DELETE_WINDOW", app.destroy)
+    app.mainloop()
+    
+    return result[0]
+# ---------------------------------
+
+
+# entry point
+
+def run_tray() -> None:
+    global _tray_icon, _config
+
+    _config = load_config()
+    bootstrap(_config)
+
+    if pystray is None or Image is None or ctk is None:
+        log.error("pystray, Pillow or customtkinter not installed; running in console mode")
+        start_proxy(_config, _show_error)
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            stop_proxy()
+        return
+
+    start_proxy(_config, _show_error)
+    _show_first_run()
+    check_ipv6_warning(_show_info)
+
+    _tray_icon = pystray.Icon(APP_NAME_CLEAN, load_icon(), "TGProxy", menu=_build_menu())
+    log.info("Tray icon running")
+    _tray_icon.run()
+
+    stop_proxy()
+    log.info("Tray app exited")
+
+
+def main() -> None:
+    if not acquire_lock("windows.py"):
+        _show_info("Приложение уже запущено.", os.path.basename(sys.argv[0]))
+        return
+        
+    # --- ПРОВЕРКА ЛИЦЕНЗИИ ПЕРЕД ЗАПУСКОМ ---
+    if not require_activation():
+        release_lock()
+        sys.exit(0)
+    # ----------------------------------------
+        
+    try:
+        run_tray()
+    finally:
+        release_lock()
+
+
+if __name__ == "__main__":
+    main()
