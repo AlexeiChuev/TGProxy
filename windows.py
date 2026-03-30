@@ -34,12 +34,13 @@ import proxy.tg_ws_proxy as tg_ws_proxy
 
 # --- ИМПОРТ НАШЕГО МОДУЛЯ HWID ---
 try:
-    from proxy.hwid_auth import get_hwid, generate_key, is_activated, save_key
-    # Хитрость: заставляем PyInstaller увидеть и упаковать рантайм PyArmor
+    # Хитрость: заставляем PyInstaller увидеть рантайм PyArmor (теперь ищем в корне)
     try:
-        import proxy.pyarmor_runtime_000000
+        import pyarmor_runtime_000000
     except ImportError:
         pass
+        
+    from proxy.hwid_auth import get_hwid, generate_key, is_activated, save_key
 except ImportError as _err:
     _err_msg = str(_err)
     def is_activated(): return False
