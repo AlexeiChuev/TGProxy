@@ -37,7 +37,7 @@ try:
     from proxy.hwid_auth import get_hwid, generate_key, is_activated, save_key
 except ImportError:
     # Заглушка на случай, если файл еще не создан
-    def is_activated(): return True
+    def is_activated(): return false
 # ---------------------------------
 
 from utils.tray_common import (
